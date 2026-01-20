@@ -13,6 +13,7 @@ export interface NodeSettings {
   offsetX?: number;
   offsetY?: number;
   linkColorPriority?: boolean;
+  childrenOrder?: Record<string, number>;
   orderY?: number;
 }
 

@@ -31,6 +31,20 @@ export const DataTable: React.FC<DataTableProps> = ({ rows, unitLabel, onChange 
     onChange(rows.filter((row) => row.id !== id));
   };
 
+  const moveRowUp = (index: number) => {
+    if (index <= 0) return;
+    const newRows = [...rows];
+    [newRows[index - 1], newRows[index]] = [newRows[index], newRows[index - 1]];
+    onChange(newRows);
+  };
+
+  const moveRowDown = (index: number) => {
+    if (index >= rows.length - 1) return;
+    const newRows = [...rows];
+    [newRows[index], newRows[index + 1]] = [newRows[index + 1], newRows[index]];
+    onChange(newRows);
+  };
+
   const handlePaste = (e: React.ClipboardEvent) => {
     const pastedData = e.clipboardData.getData('text');
     const lines = pastedData.trim().split('\n');
@@ -60,6 +74,7 @@ export const DataTable: React.FC<DataTableProps> = ({ rows, unitLabel, onChange 
       <table className="data-table" onPaste={handlePaste}>
         <thead>
           <tr>
+            <th style={{ width: '60px' }}>#</th>
             <th>Источник</th>
             <th>Потребитель</th>
             <th>Текущий период ({unitLabel})</th>
@@ -68,8 +83,29 @@ export const DataTable: React.FC<DataTableProps> = ({ rows, unitLabel, onChange 
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
+          {rows.map((row, index) => (
             <tr key={row.id}>
+              <td className="row-order-cell">
+                <span className="row-number">{index + 1}</span>
+                <div className="row-order-buttons">
+                  <button
+                    className="order-btn"
+                    onClick={() => moveRowUp(index)}
+                    disabled={index === 0}
+                    title="Переместить вверх"
+                  >
+                    ↑
+                  </button>
+                  <button
+                    className="order-btn"
+                    onClick={() => moveRowDown(index)}
+                    disabled={index === rows.length - 1}
+                    title="Переместить вниз"
+                  >
+                    ↓
+                  </button>
+                </div>
+              </td>
               <td>
                 <input
                   type="text"

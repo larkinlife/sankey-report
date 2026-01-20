@@ -18,7 +18,6 @@ interface SankeyChartProps {
   selectedImageId: string | null;
   onNodeSelect: (nodeName: string | null) => void;
   onNodeMove: (nodeName: string, offsetX: number, offsetY: number) => void;
-  onNodesReorder: (updates: Array<{ nodeName: string; orderY: number; offsetX?: number; offsetY?: number }>) => void;
   onImageSelect: (id: string | null) => void;
   onImageUpdate: (id: string, updates: { x?: number; y?: number; width?: number; height?: number }) => void;
 }
@@ -28,12 +27,13 @@ export interface SankeyChartHandle {
 }
 
 export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
-  ({ rows, settings, selectedNode, selectedImageId, onNodeSelect, onNodeMove, onNodesReorder, onImageSelect, onImageUpdate }, ref) => {
+  ({ rows, settings, selectedNode, selectedImageId, onNodeSelect, onNodeMove, onImageSelect, onImageUpdate }, ref) => {
     const svgRef = useRef<SVGSVGElement>(null);
     const dragStartRef = useRef<{ x: number; y: number; nodeName: string } | null>(null);
     const dragOffsetRef = useRef<{ nodeName: string; deltaX: number; deltaY: number } | null>(null);
     const imageDragRef = useRef<{ id: string; startX: number; startY: number; x: number; y: number } | null>(null);
     const imageResizeRef = useRef<{ id: string; startX: number; startY: number; width: number; height: number } | null>(null);
+    const layoutCacheRef = useRef<{ key: string; graph: { nodes: SankeyNodeExtended[]; links: SankeyLinkExtended[] } } | null>(null);
 
     useImperativeHandle(ref, () => ({
       getSvgRef: () => svgRef.current
@@ -88,13 +88,20 @@ export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
         .attr('fill', settings.colors.headerText)
         .text(settings.periodLabel || 'Финансовый отчет');
 
-      const getOrder = (nodeName: string) => {
-        const setting = settings.nodeSettings[nodeName];
-        if (setting && typeof setting.orderY === 'number') return setting.orderY;
-        return nodeOrderIndex.get(nodeName) ?? 0;
-      };
-
       const nodeOrderIndex = new Map(nodes.map((node, index) => [node.name, index]));
+
+      // Create link order index based on row position in table
+      const linkOrderIndex = new Map<string, number>();
+      validRows.forEach((row, index) => {
+        const key = `${row.source.trim()}->${row.target.trim()}`;
+        linkOrderIndex.set(key, index);
+      });
+
+      const getLinkOrder = (sourceName: string, targetName: string) => {
+        const key = `${sourceName}->${targetName}`;
+        return linkOrderIndex.get(key) ?? Infinity;
+      };
+      const getNodeSortOrder = (nodeName: string) => nodeOrderIndex.get(nodeName) ?? 0;
       const paddingScale = Math.max(1, settings.linkWidthScale || 1);
       const textPad = (settings.nodeLabelSize || 12) + (settings.nodeValueSize || 11) * 2 + 10;
       const nodePaddingValue = Math.max(25 * paddingScale, textPad);
@@ -105,7 +112,7 @@ export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
         .nodeWidth(settings.nodeWidth || 20)
         .nodePadding(nodePaddingValue)
         .nodeSort((a, b) => {
-          const diff = getOrder(a.name) - getOrder(b.name);
+          const diff = getNodeSortOrder(a.name) - getNodeSortOrder(b.name);
           if (diff !== 0) return diff;
           return a.name.localeCompare(b.name);
         })
@@ -114,18 +121,24 @@ export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
           [width - margin.right, height - margin.bottom],
         ]);
 
-      const graph = sankeyLayout({
-        nodes: nodes.map((d) => ({ ...d })),
-        links: links.map((d) => ({ ...d })),
-      }) as { nodes: SankeyNodeExtended[]; links: SankeyLinkExtended[] };
-
-      const columnByName = new Map<string, number>();
-      graph.nodes.forEach((node) => {
-        const key = typeof node.layer === 'number'
-          ? node.layer
-          : Math.round((node.x0 || 0) / 10);
-        columnByName.set(node.name, key);
+      const layoutKey = JSON.stringify({
+        rows: validRows.map((row) => [row.source.trim(), row.target.trim(), row.currentPeriod, row.previousPeriod]),
+        width,
+        height,
+        nodeWidth: settings.nodeWidth || 20,
+        nodePadding: nodePaddingValue,
       });
+
+      let graph: { nodes: SankeyNodeExtended[]; links: SankeyLinkExtended[] };
+      if (layoutCacheRef.current && layoutCacheRef.current.key === layoutKey) {
+        graph = layoutCacheRef.current.graph;
+      } else {
+        graph = sankeyLayout({
+          nodes: nodes.map((d) => ({ ...d })),
+          links: links.map((d) => ({ ...d })),
+        }) as { nodes: SankeyNodeExtended[]; links: SankeyLinkExtended[] };
+        layoutCacheRef.current = { key: layoutKey, graph };
+      }
 
       const nodeScale = settings.linkWidthScale || 1;
       const minNodeHeight = 8;
@@ -182,21 +195,14 @@ export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
         return { x: clampedX, y: clampedY };
       };
 
-      const getNodeVisualCenter = (node: SankeyNodeExtended) => {
-        const offset = getClampedOffset(node);
-        const center = ((node.y0 || 0) + (node.y1 || 0)) / 2;
-        return center + offset.y;
-      };
-
       graph.nodes.forEach((node) => {
         if (node.sourceLinks) {
           node.sourceLinks.sort((a, b) => {
             const aTarget = a.target as SankeyNodeExtended;
             const bTarget = b.target as SankeyNodeExtended;
-            const orderDiff = getOrder(aTarget.name) - getOrder(bTarget.name);
-            if (orderDiff !== 0) return orderDiff;
-            const diff = getNodeVisualCenter(aTarget) - getNodeVisualCenter(bTarget);
-            if (diff !== 0) return diff;
+            const orderA = getLinkOrder(node.name, aTarget.name);
+            const orderB = getLinkOrder(node.name, bTarget.name);
+            if (orderA !== orderB) return orderA - orderB;
             return aTarget.name.localeCompare(bTarget.name);
           });
         }
@@ -204,10 +210,9 @@ export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
           node.targetLinks.sort((a, b) => {
             const aSource = a.source as SankeyNodeExtended;
             const bSource = b.source as SankeyNodeExtended;
-            const orderDiff = getOrder(aSource.name) - getOrder(bSource.name);
-            if (orderDiff !== 0) return orderDiff;
-            const diff = getNodeVisualCenter(aSource) - getNodeVisualCenter(bSource);
-            if (diff !== 0) return diff;
+            const orderA = getLinkOrder(aSource.name, node.name);
+            const orderB = getLinkOrder(bSource.name, node.name);
+            if (orderA !== orderB) return orderA - orderB;
             return aSource.name.localeCompare(bSource.name);
           });
         }
@@ -470,60 +475,12 @@ export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
           if (moved < 2) {
             onNodeSelect(dragStartRef.current.nodeName === selectedNode ? null : dragStartRef.current.nodeName);
           } else {
-            const draggedNode = graph.nodes.find((node) => node.name === dragStartRef.current?.nodeName);
-            if (draggedNode) {
-              const columnKey = columnByName.get(draggedNode.name);
-              const columnNodes = graph.nodes.filter((node) => columnByName.get(node.name) === columnKey);
-              const ordered = [...columnNodes].sort((a, b) => {
-                const diff = getOrder(a.name) - getOrder(b.name);
-                if (diff !== 0) return diff;
-                return a.name.localeCompare(b.name);
-              });
-
-              const finalOffset = getClampedOffset(draggedNode, {
-                nodeName: draggedNode.name,
-                deltaX,
-                deltaY,
-              });
-              const targetCenter = ((draggedNode.y0 || 0) + (draggedNode.y1 || 0)) / 2 + finalOffset.y;
-
-              const others = ordered.filter((n) => n.name !== draggedNode.name);
-              const centers = others.map((n) => {
-                const off = getClampedOffset(n);
-                return ((n.y0 || 0) + (n.y1 || 0)) / 2 + off.y;
-              });
-
-              let targetIndex = centers.length;
-              for (let i = 0; i < centers.length; i += 1) {
-                if (targetCenter < centers[i]) {
-                  targetIndex = i;
-                  break;
-                }
-              }
-
-              const newOrder = [...others];
-              newOrder.splice(targetIndex, 0, draggedNode);
-
-              const updates = newOrder.map((node, index) => {
-                const update: { nodeName: string; orderY: number; offsetX?: number; offsetY?: number } = {
-                  nodeName: node.name,
-                  orderY: index,
-                };
-                if (node.name === draggedNode.name) {
-                  update.offsetX = finalOffset.x;
-                  update.offsetY = finalOffset.y;
-                }
-                return update;
-              });
-
-              onNodesReorder(updates);
-            } else {
-              onNodeMove(
-                dragStartRef.current.nodeName,
-                currentOffsetX + deltaX,
-                currentOffsetY + deltaY
-              );
-            }
+            // Free movement - simply update the node position
+            onNodeMove(
+              dragStartRef.current.nodeName,
+              currentOffsetX + deltaX,
+              currentOffsetY + deltaY
+            );
           }
           dragOffsetRef.current = null;
           dragStartRef.current = null;
@@ -652,7 +609,7 @@ export const SankeyChart = forwardRef<SankeyChartHandle, SankeyChartProps>(
         onNodeSelect(null);
       });
 
-    }, [rows, settings, selectedNode, selectedImageId, onNodeSelect, onNodeMove, onNodesReorder, onImageSelect, onImageUpdate, getNodeSettings]);
+    }, [rows, settings, selectedNode, selectedImageId, onNodeSelect, onNodeMove, onImageSelect, onImageUpdate, getNodeSettings]);
 
     return (
       <div className="sankey-chart-container">

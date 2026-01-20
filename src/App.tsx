@@ -10,7 +10,7 @@ import { NodeEditor } from './components/NodeEditor';
 import { AppearanceSettings } from './components/AppearanceSettings';
 import { BalanceSummary } from './components/BalanceSummary';
 import { ImageManager } from './components/ImageManager';
-import { prepareNodesAndLinks } from './utils/sankeyHelpers';
+import { prepareNodesAndLinks, buildParentGroups } from './utils/sankeyHelpers';
 import { sankey } from 'd3-sankey';
 import './App.css';
 
@@ -33,33 +33,123 @@ const sampleData: FlowRow[] = [
   { id: 'row-8', source: 'EBITDA', target: 'Чистая прибыль', currentPeriod: 42.6, previousPeriod: 38.2 },
 ];
 
+const baseSettings: ReportSettings = {
+  logo: null,
+  periodLabel: '2024 год / 2023 год',
+  colors: defaultColors,
+  unitLabel: 'млрд ₽',
+  logoWidth: 60,
+  logoHeight: 50,
+  headerFontSize: 24,
+  nodeLabelSize: 12,
+  nodeValueSize: 11,
+  nodeWidth: 20,
+  linkWidthScale: 1,
+  chartWidth: 1200,
+  chartHeight: 700,
+  images: [],
+  nodeSettings: {},
+};
+
 const STORAGE_ROWS_KEY = 'sankey-report:rows';
 const STORAGE_SETTINGS_KEY = 'sankey-report:settings';
 
+const loadRowsFromStorage = (): FlowRow[] => {
+  try {
+    const savedRows = localStorage.getItem(STORAGE_ROWS_KEY);
+    if (savedRows) {
+      const parsedRows = JSON.parse(savedRows);
+      if (Array.isArray(parsedRows)) {
+        const validRows = parsedRows.filter((row) => (
+          row &&
+          typeof row.id === 'string' &&
+          typeof row.source === 'string' &&
+          typeof row.target === 'string' &&
+          typeof row.currentPeriod === 'number' &&
+          typeof row.previousPeriod === 'number'
+        ));
+        if (validRows.length > 0) {
+          return validRows;
+        }
+      }
+    }
+  } catch {
+    // Ignore corrupted localStorage data.
+  }
+  return sampleData;
+};
+
+const loadSettingsFromStorage = (): ReportSettings => {
+  try {
+    const savedSettings = localStorage.getItem(STORAGE_SETTINGS_KEY);
+    if (savedSettings) {
+      const parsedSettings = JSON.parse(savedSettings) as Partial<ReportSettings>;
+      if (parsedSettings && typeof parsedSettings === 'object') {
+        const rowsForMigration = loadRowsFromStorage();
+        const mergedSettings = {
+          ...baseSettings,
+          ...parsedSettings,
+          colors: {
+            ...baseSettings.colors,
+            ...(parsedSettings.colors || {}),
+          },
+          nodeSettings: parsedSettings.nodeSettings || {},
+          images: Array.isArray(parsedSettings.images) ? parsedSettings.images : baseSettings.images,
+          unitLabel: typeof parsedSettings.unitLabel === 'string' ? parsedSettings.unitLabel : baseSettings.unitLabel,
+        };
+        const { parentByNode } = buildParentGroups(rowsForMigration);
+        const nextNodeSettings = { ...mergedSettings.nodeSettings };
+        const parentOrders = new Map<string, Record<string, number>>();
+
+        Object.entries(mergedSettings.nodeSettings).forEach(([nodeName, nodeSettings]) => {
+          if (typeof nodeSettings.orderY !== 'number') return;
+          const parent = parentByNode.get(nodeName);
+          if (!parent) return;
+          const orderMap = parentOrders.get(parent) || {};
+          orderMap[nodeName] = nodeSettings.orderY;
+          parentOrders.set(parent, orderMap);
+        });
+
+        parentOrders.forEach((orderMap, parentName) => {
+          const parentSettings = nextNodeSettings[parentName] || {};
+          const mergedOrder = { ...(parentSettings.childrenOrder || {}) };
+          Object.entries(orderMap).forEach(([childName, order]) => {
+            if (typeof mergedOrder[childName] !== 'number') {
+              mergedOrder[childName] = order;
+            }
+          });
+          nextNodeSettings[parentName] = {
+            ...parentSettings,
+            childrenOrder: mergedOrder,
+          };
+        });
+
+        return {
+          ...mergedSettings,
+          nodeSettings: nextNodeSettings,
+        };
+      }
+    }
+  } catch {
+    // Ignore corrupted localStorage data.
+  }
+  return baseSettings;
+};
+
 function App() {
-  const [rows, setRows] = useState<FlowRow[]>(sampleData);
-  const [settings, setSettings] = useState<ReportSettings>({
-    logo: null,
-    periodLabel: '2024 год / 2023 год',
-    colors: defaultColors,
-    unitLabel: 'млрд ₽',
-    logoWidth: 60,
-    logoHeight: 50,
-    headerFontSize: 24,
-    nodeLabelSize: 12,
-    nodeValueSize: 11,
-    nodeWidth: 20,
-    linkWidthScale: 1,
-    chartWidth: 1200,
-    chartHeight: 700,
-    images: [],
-    nodeSettings: {},
-  });
+  const [rows, setRows] = useState<FlowRow[]>(() => loadRowsFromStorage());
+  const [settings, setSettings] = useState<ReportSettings>(() => loadSettingsFromStorage());
   const [activeTab, setActiveTab] = useState<'data' | 'settings'>('data');
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
 
   const chartRef = useRef<SankeyChartHandle>(null);
+  const exportSvgRef = useRef<SVGSVGElement | null>(null);
+
+  const validRows = useMemo(
+    () => rows.filter((r) => r.source.trim() && r.target.trim() && r.currentPeriod > 0),
+    [rows]
+  );
 
   const handleColorsChange = (colors: ColorSettings) => {
     setSettings({ ...settings, colors });
@@ -78,9 +168,9 @@ function App() {
   };
 
   const handleAutoLayout = useCallback(() => {
-    const validRows = rows.filter((r) => r.source.trim() && r.target.trim() && r.currentPeriod > 0);
     if (validRows.length === 0) return;
 
+    const parentGroups = buildParentGroups(validRows);
     const { nodes, links } = prepareNodesAndLinks(validRows);
     const width = settings.chartWidth || 1200;
     const height = settings.chartHeight || 700;
@@ -104,27 +194,36 @@ function App() {
     }) as { nodes: Array<{ name: string; x0?: number; y0?: number; layer?: number }>; links: unknown[] };
 
     const updates: Record<string, NodeSettings> = {};
-    const columns = new Map<number, Array<{ name: string; y0?: number }>>();
+    const nodeByName = new Map(graph.nodes.map((node) => [node.name, node]));
 
     graph.nodes.forEach((node) => {
-      const key = typeof node.layer === 'number'
-        ? node.layer
-        : Math.round((node.x0 || 0) / 10);
-      const list = columns.get(key) || [];
-      list.push(node);
-      columns.set(key, list);
+      updates[node.name] = {
+        ...(settings.nodeSettings[node.name] || {}),
+        offsetX: 0,
+        offsetY: 0,
+      };
     });
 
-    columns.forEach((list) => {
-      list.sort((a, b) => (a.y0 || 0) - (b.y0 || 0));
-      list.forEach((node, index) => {
-        updates[node.name] = {
-          ...(settings.nodeSettings[node.name] || {}),
-          offsetX: 0,
-          offsetY: 0,
-          orderY: index,
-        };
+    parentGroups.parentChildren.forEach((children, parent) => {
+      const ordered = children
+        .map((name) => nodeByName.get(name))
+        .filter((node): node is { name: string; y0?: number; y1?: number } => !!node)
+        .sort((a, b) => {
+          const aCenter = ((a.y0 || 0) + (a.y1 || 0)) / 2;
+          const bCenter = ((b.y0 || 0) + (b.y1 || 0)) / 2;
+          if (aCenter !== bCenter) return aCenter - bCenter;
+          return a.name.localeCompare(b.name);
+        });
+
+      const childrenOrder: Record<string, number> = {};
+      ordered.forEach((node, index) => {
+        childrenOrder[node.name] = index;
       });
+
+      updates[parent] = {
+        ...(updates[parent] || settings.nodeSettings[parent] || {}),
+        childrenOrder,
+      };
     });
 
     setSettings((prev) => ({
@@ -134,7 +233,7 @@ function App() {
         ...updates,
       },
     }));
-  }, [rows, settings, setSettings]);
+  }, [settings, validRows]);
 
   const handleNodeSelect = useCallback((nodeName: string | null) => {
     setSelectedNode(nodeName);
@@ -155,22 +254,6 @@ function App() {
         },
       },
     }));
-  }, []);
-
-  const handleNodesReorder = useCallback((updates: Array<{ nodeName: string; orderY: number; offsetX?: number; offsetY?: number }>) => {
-    setSettings((prev) => {
-      const nextNodeSettings = { ...prev.nodeSettings };
-      updates.forEach((update) => {
-        const existing = nextNodeSettings[update.nodeName] || {};
-        nextNodeSettings[update.nodeName] = {
-          ...existing,
-          orderY: update.orderY,
-          offsetX: update.offsetX !== undefined ? update.offsetX : existing.offsetX,
-          offsetY: update.offsetY !== undefined ? update.offsetY : existing.offsetY,
-        };
-      });
-      return { ...prev, nodeSettings: nextNodeSettings };
-    });
   }, []);
 
   const handleNodeSettingsChange = useCallback((nodeName: string, nodeSettings: NodeSettings) => {
@@ -234,7 +317,6 @@ function App() {
   }, []);
 
   const layoutColumns = useMemo(() => {
-    const validRows = rows.filter((r) => r.source.trim() && r.target.trim() && r.currentPeriod > 0);
     if (validRows.length === 0) {
       return { columnByName: new Map<string, number>(), columns: new Map<number, Array<{ name: string; visualY: number }>>() };
     }
@@ -247,19 +329,15 @@ function App() {
     const textPad = (settings.nodeLabelSize || 12) + (settings.nodeValueSize || 11) * 2 + 10;
     const nodePadding = Math.max(25 * scale, textPad);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const nodeOrderIndex = new Map(nodes.map((node, index) => [node.name, index]));
-    const getOrder = (nodeName: string) => {
-      const stored = settings.nodeSettings[nodeName]?.orderY;
-      if (typeof stored === 'number') return stored;
-      return nodeOrderIndex.get(nodeName) ?? 0;
-    };
+    const getNodeSortOrder = (nodeName: string) => nodeOrderIndex.get(nodeName) ?? 0;
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const layout = sankey<any, any>()
       .nodeWidth(settings.nodeWidth || 20)
       .nodePadding(nodePadding)
       .nodeSort((a, b) => {
-        const diff = getOrder(a.name) - getOrder(b.name);
+        const diff = getNodeSortOrder(a.name) - getNodeSortOrder(b.name);
         if (diff !== 0) return diff;
         return a.name.localeCompare(b.name);
       })
@@ -299,140 +377,87 @@ function App() {
     });
 
     return { columnByName, columns: resultColumns };
-  }, [rows, settings]);
+  }, [settings, validRows]);
 
-  const parentGroups = useMemo(() => {
-    const parentByNode = new Map<string, string>();
-    const parentChildren = new Map<string, string[]>();
-    const bestValue = new Map<string, number>();
+  const parentGroups = useMemo(() => buildParentGroups(validRows), [validRows]);
 
-    rows.forEach((row) => {
-      const source = row.source.trim();
-      const target = row.target.trim();
-      if (!source || !target) return;
-
-      const list = parentChildren.get(source) || [];
-      if (!list.includes(target)) {
-        list.push(target);
-        parentChildren.set(source, list);
-      }
-
-      const currentValue = Number.isFinite(row.currentPeriod) ? row.currentPeriod : 0;
-      const best = bestValue.get(target);
-      if (best === undefined || currentValue > best) {
-        bestValue.set(target, currentValue);
-        parentByNode.set(target, source);
-      }
-    });
-
-    return { parentByNode, parentChildren };
-  }, [rows]);
-
-  const moveNodeByDirection = useCallback((nodeName: string, direction: 'up' | 'down') => {
+  const getSiblingOrder = useCallback((nodeName: string) => {
     const parent = parentGroups.parentByNode.get(nodeName);
-    if (!parent) return;
+    if (!parent) return null;
     const siblings = parentGroups.parentChildren.get(parent);
-    if (!siblings || siblings.length <= 1) return;
+    if (!siblings || siblings.length <= 1) return null;
 
     const columnKey = layoutColumns.columnByName.get(nodeName);
-    if (columnKey === undefined) return;
+    if (columnKey === undefined) return null;
     const columnList = layoutColumns.columns.get(columnKey);
-    if (!columnList || columnList.length <= 1) return;
+    if (!columnList || columnList.length <= 1) return null;
 
-    const columnOrder = columnList.map((item) => item.name);
     const siblingSet = new Set(siblings);
-    const siblingOrder = columnOrder.filter((name) => siblingSet.has(name));
+    const siblingsInColumn = columnList
+      .map((item) => item.name)
+      .filter((name) => siblingSet.has(name));
 
+    if (siblingsInColumn.length <= 1) return null;
+
+    const parentSettings = settings.nodeSettings[parent];
+    const childrenOrder = parentSettings?.childrenOrder || {};
+    const fallbackIndex = new Map<string, number>();
+    siblingsInColumn.forEach((name, index) => {
+      fallbackIndex.set(name, index);
+    });
+
+    const ordered = [...siblingsInColumn].sort((a, b) => {
+      const orderA = childrenOrder[a];
+      const orderB = childrenOrder[b];
+      const aValue = typeof orderA === 'number' ? orderA : fallbackIndex.get(a) ?? 0;
+      const bValue = typeof orderB === 'number' ? orderB : fallbackIndex.get(b) ?? 0;
+      if (aValue !== bValue) return aValue - bValue;
+      return a.localeCompare(b);
+    });
+
+    return { parent, order: ordered };
+  }, [layoutColumns, parentGroups, settings.nodeSettings]);
+
+  const moveNodeByDirection = useCallback((nodeName: string, direction: 'up' | 'down') => {
+    const siblingInfo = getSiblingOrder(nodeName);
+    if (!siblingInfo) return;
+
+    const { parent, order: siblingOrder } = siblingInfo;
     const idx = siblingOrder.indexOf(nodeName);
     if (idx === -1) return;
     const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
     if (targetIdx < 0 || targetIdx >= siblingOrder.length) return;
 
-    const swapWith = siblingOrder[targetIdx];
-    const indexA = columnOrder.indexOf(nodeName);
-    const indexB = columnOrder.indexOf(swapWith);
-    if (indexA === -1 || indexB === -1) return;
-
-    const updatedColumnOrder = [...columnOrder];
-    updatedColumnOrder[indexA] = swapWith;
-    updatedColumnOrder[indexB] = nodeName;
+    const updatedOrder = [...siblingOrder];
+    const swapWith = updatedOrder[targetIdx];
+    updatedOrder[targetIdx] = nodeName;
+    updatedOrder[idx] = swapWith;
 
     setSettings((prev) => {
       const next = { ...prev.nodeSettings };
-      updatedColumnOrder.forEach((name, index) => {
-        next[name] = {
-          ...next[name],
-          orderY: index,
-        };
+      const parentSettings = next[parent] || {};
+      const childrenOrder = { ...(parentSettings.childrenOrder || {}) };
+      updatedOrder.forEach((name, index) => {
+        childrenOrder[name] = index;
       });
+      next[parent] = {
+        ...parentSettings,
+        childrenOrder,
+      };
       return { ...prev, nodeSettings: next };
     });
-  }, [layoutColumns, parentGroups]);
+  }, [getSiblingOrder]);
 
   const getMoveAvailability = useCallback((nodeName: string | null) => {
     if (!nodeName) return { canMoveUp: false, canMoveDown: false };
-    const parent = parentGroups.parentByNode.get(nodeName);
-    if (!parent) return { canMoveUp: false, canMoveDown: false };
-    const siblings = parentGroups.parentChildren.get(parent);
-    if (!siblings || siblings.length <= 1) return { canMoveUp: false, canMoveDown: false };
-
-    const columnKey = layoutColumns.columnByName.get(nodeName);
-    if (columnKey === undefined) return { canMoveUp: false, canMoveDown: false };
-    const columnList = layoutColumns.columns.get(columnKey);
-    if (!columnList || columnList.length <= 1) return { canMoveUp: false, canMoveDown: false };
-
-    const columnOrder = columnList.map((item) => item.name);
-    const siblingSet = new Set(siblings);
-    const siblingOrder = columnOrder.filter((name) => siblingSet.has(name));
-    const idx = siblingOrder.indexOf(nodeName);
+    const siblingInfo = getSiblingOrder(nodeName);
+    if (!siblingInfo) return { canMoveUp: false, canMoveDown: false };
+    const idx = siblingInfo.order.indexOf(nodeName);
     return {
       canMoveUp: idx > 0,
-      canMoveDown: idx >= 0 && idx < siblingOrder.length - 1,
+      canMoveDown: idx >= 0 && idx < siblingInfo.order.length - 1,
     };
-  }, [layoutColumns, parentGroups]);
-
-  useEffect(() => {
-    try {
-      const savedRows = localStorage.getItem(STORAGE_ROWS_KEY);
-      const savedSettings = localStorage.getItem(STORAGE_SETTINGS_KEY);
-
-      if (savedRows) {
-        const parsedRows = JSON.parse(savedRows);
-        if (Array.isArray(parsedRows)) {
-          const validRows = parsedRows.filter((row) => (
-            row &&
-            typeof row.id === 'string' &&
-            typeof row.source === 'string' &&
-            typeof row.target === 'string' &&
-            typeof row.currentPeriod === 'number' &&
-            typeof row.previousPeriod === 'number'
-          ));
-          if (validRows.length > 0) {
-            setRows(validRows);
-          }
-        }
-      }
-
-      if (savedSettings) {
-        const parsedSettings = JSON.parse(savedSettings);
-        if (parsedSettings && typeof parsedSettings === 'object') {
-          setSettings((prev) => ({
-            ...prev,
-            ...parsedSettings,
-            colors: {
-              ...prev.colors,
-              ...(parsedSettings.colors || {}),
-            },
-            nodeSettings: parsedSettings.nodeSettings || {},
-            images: Array.isArray(parsedSettings.images) ? parsedSettings.images : prev.images,
-            unitLabel: typeof parsedSettings.unitLabel === 'string' ? parsedSettings.unitLabel : prev.unitLabel,
-          }));
-        }
-      }
-    } catch {
-      // Ignore corrupted localStorage data.
-    }
-  }, []);
+  }, [getSiblingOrder]);
 
   useEffect(() => {
     try {
@@ -443,13 +468,9 @@ function App() {
     }
   }, [rows, settings]);
 
-  // Get current svgRef for export
-  const getExportSvgRef = () => {
-    if (chartRef.current) {
-      return { current: chartRef.current.getSvgRef() };
-    }
-    return { current: null };
-  };
+  useEffect(() => {
+    exportSvgRef.current = chartRef.current?.getSvgRef() ?? null;
+  });
 
   return (
     <div className="app">
@@ -531,7 +552,7 @@ function App() {
           <div className="chart-header">
             <h2>Предпросмотр</h2>
             <ExportButtons
-              svgRef={getExportSvgRef()}
+              svgRef={exportSvgRef}
               filename={`sankey-report-${new Date().toISOString().split('T')[0]}`}
             />
           </div>
@@ -546,7 +567,6 @@ function App() {
                 selectedImageId={selectedImageId}
                 onNodeSelect={handleNodeSelect}
                 onNodeMove={handleNodeMove}
-                onNodesReorder={handleNodesReorder}
                 onImageSelect={handleImageSelect}
                 onImageUpdate={handleImageUpdate}
               />

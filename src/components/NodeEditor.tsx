@@ -41,8 +41,9 @@ export const NodeEditor: React.FC<NodeEditorProps> = ({
   };
 
   const handleClearColor = () => {
-    const { color: _, ...rest } = settings;
-    onChange(nodeName, rest);
+    const next = { ...settings };
+    delete next.color;
+    onChange(nodeName, next);
   };
 
   const handleLinkPriorityChange = (checked: boolean) => {

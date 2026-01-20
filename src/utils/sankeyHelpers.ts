@@ -95,6 +95,36 @@ export function prepareNodesAndLinks(rows: FlowRow[]): {
   return { nodes, links };
 }
 
+export function buildParentGroups(rows: FlowRow[]): {
+  parentByNode: Map<string, string>;
+  parentChildren: Map<string, string[]>;
+} {
+  const parentByNode = new Map<string, string>();
+  const parentChildren = new Map<string, string[]>();
+  const bestValue = new Map<string, number>();
+
+  rows.forEach((row) => {
+    const source = row.source.trim();
+    const target = row.target.trim();
+    if (!source || !target) return;
+
+    const list = parentChildren.get(source) || [];
+    if (!list.includes(target)) {
+      list.push(target);
+      parentChildren.set(source, list);
+    }
+
+    const currentValue = Number.isFinite(row.currentPeriod) ? row.currentPeriod : 0;
+    const best = bestValue.get(target);
+    if (best === undefined || currentValue > best) {
+      bestValue.set(target, currentValue);
+      parentByNode.set(target, source);
+    }
+  });
+
+  return { parentByNode, parentChildren };
+}
+
 export function formatNumber(value: number): string {
   return value.toFixed(1).replace('.', ',');
 }
